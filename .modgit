@@ -1,0 +1,24 @@
+[module "build-system"]
+    path = Makefile
+    path = config.mak.uname
+    path = contrib/buildsystems
+
+[module "documentation"]
+    path = Documentation
+    path = README.md
+    path = INSTALL
+
+[module "builtins"]
+    path = builtin
+    path = builtin.h
+    depends = libgit
+
+[module "libgit"]
+    path = .
+    exclude = Documentation
+    exclude = builtin
+    exclude = t
+
+[module "tests"]
+    path = t
+    depends = libgit
