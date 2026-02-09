@@ -220,6 +220,7 @@ int cmd_mktag(int argc, const char **argv, const char *prefix, struct repository
 int cmd_mktree(int argc, const char **argv, const char *prefix, struct repository *repo);
 int cmd_multi_pack_index(int argc, const char **argv, const char *prefix, struct repository *repo);
 int cmd_mv(int argc, const char **argv, const char *prefix, struct repository *repo);
+int cmd_modgit(int argc, const char **argv, const char *prefix, struct repository *repo);
 int cmd_name_rev(int argc, const char **argv, const char *prefix, struct repository *repo);
 int cmd_notes(int argc, const char **argv, const char *prefix, struct repository *repo);
 int cmd_pack_objects(int argc, const char **argv, const char *prefix, struct repository *repo);
