@@ -1,0 +1,94 @@
+name: Build & Release ModuleGit
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev gettext
+
+      - name: Build Git with ModuleGit
+        run: make -j$(nproc) NO_PERL=1 NO_PYTHON=1
+
+      - name: Verify modgit subcommand
+        run: ./git modgit list 2>&1 || true
+
+      - name: Package Linux binary
+        run: |
+          mkdir -p dist
+          cp git dist/git-modgit-linux
+          chmod +x dist/git-modgit-linux
+          tar -czf dist/modulegit-linux-amd64.tar.gz -C dist git-modgit-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: dist/modulegit-linux-amd64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-expat
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-pcre2
+            git
+
+      - uses: actions/checkout@v4
+
+      - name: Build Git with ModuleGit (MINGW64)
+        run: make -j$(nproc) NO_PERL=1 NO_PYTHON=1 CURLDIR=/mingw64
+
+      - name: Verify modgit subcommand
+        run: ./git.exe modgit list 2>&1 || true
+
+      - name: Package Windows binary
+        run: |
+          mkdir -p dist
+          cp git.exe dist/git-modgit.exe
+          cd dist && 7z a modulegit-windows-amd64.zip git-modgit.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: dist/modulegit-windows-amd64.zip
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/linux-build/modulegit-linux-amd64.tar.gz
+            artifacts/windows-build/modulegit-windows-amd64.zip
