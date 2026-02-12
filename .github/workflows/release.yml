@@ -54,6 +54,7 @@ jobs:
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-pcre2
             git
+            zip
 
       - uses: actions/checkout@v4
 
@@ -67,7 +68,7 @@ jobs:
         run: |
           mkdir -p dist
           cp git.exe dist/git-modgit.exe
-          cd dist && 7z a modulegit-windows-amd64.zip git-modgit.exe
+          cd dist && zip modulegit-windows-amd64.zip git-modgit.exe
 
       - uses: actions/upload-artifact@v4
         with:
