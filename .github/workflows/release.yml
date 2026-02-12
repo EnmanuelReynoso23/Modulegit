@@ -81,6 +81,18 @@ jobs:
           name: windows-build
           path: dist/modulegit-windows-amd64.zip
 
+      # Build Inno Setup installer (runs in PowerShell, not MSYS2)
+      - name: Create Windows installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          iscc installer\modulegit-setup.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: output/ModuleGit-Setup.exe
+
   release:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
@@ -99,3 +111,4 @@ jobs:
           files: |
             artifacts/linux-build/modulegit-linux-amd64.tar.gz
             artifacts/windows-build/modulegit-windows-amd64.zip
+            artifacts/windows-installer/ModuleGit-Setup.exe
