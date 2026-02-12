@@ -1170,6 +1170,48 @@ static int cmd_modgit_ai_context(int argc, const char **argv, const char *prefix
 }
 
 /*
+ * ── HELP ─────────────────────────────────────────────────
+ */
+
+static void show_modgit_help(void)
+{
+    printf("\n");
+    printf("  ModuleGit - Modular Git for Monorepos\n");
+    printf("  ======================================\n");
+    printf("\n");
+    printf("  usage: git modgit <command> [<args>]\n");
+    printf("\n");
+    printf("  Core Workflow:\n");
+    printf("    switch [--full|--dev] <module>  Switch to a module\n");
+    printf("    status                          Show module-aware status\n");
+    printf("    commit [message]                Module-scoped commit\n");
+    printf("    reset                           Restore full repo visibility\n");
+    printf("    run <command>                   Run command in module context\n");
+    printf("\n");
+    printf("  Setup & Discovery:\n");
+    printf("    list                            List all modules\n");
+    printf("    clone --module=<name> <url>     Partial clone for a module\n");
+    printf("    init <name> --path=<p>          Add module to .modgit\n");
+    printf("    ai-context --module=<name>      Generate AI context dump\n");
+    printf("\n");
+    printf("  Orphan Branches:\n");
+    printf("    orphan <module>                 Create isolated module branch\n");
+    printf("    sync [--source=<branch>]        Sync from source branch\n");
+    printf("    push [--target=<branch>]        Push changes to target branch\n");
+    printf("\n");
+    printf("    help                            Show this help message\n");
+    printf("\n");
+    printf("  See 'https://modulegit.vercel.app' for full documentation.\n");
+    printf("\n");
+}
+
+static int cmd_modgit_help(int argc, const char **argv, const char *prefix, struct repository *repo)
+{
+    show_modgit_help();
+    return 0;
+}
+
+/*
  * ── MAIN DISPATCH ────────────────────────────────────────
  */
 
@@ -1189,14 +1231,17 @@ int cmd_modgit(int argc, const char **argv, const char *prefix, struct repositor
 		OPT_SUBCOMMAND("push", &fn, cmd_modgit_push),
 		OPT_SUBCOMMAND("init", &fn, cmd_modgit_init),
 		OPT_SUBCOMMAND("ai-context", &fn, cmd_modgit_ai_context),
+		OPT_SUBCOMMAND("help", &fn, cmd_modgit_help),
 		OPT_END()
 	};
 
-	argc = parse_options(argc, argv, prefix, options, modgit_usage, 0);
+	argc = parse_options(argc, argv, prefix, options, modgit_usage,
+			     PARSE_OPT_SUBCOMMAND_OPTIONAL);
 
     if (fn)
 		return fn(argc, argv, prefix, repo);
 
-    usage_with_options(modgit_usage, options);
-    return 1;
+    /* No subcommand given — show help */
+    show_modgit_help();
+    return 0;
 }
