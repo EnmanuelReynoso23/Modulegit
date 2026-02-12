@@ -6,11 +6,13 @@
 
 struct module_def {
     char *name;
+    char *parent;           /* auto-detected: "frontend/css" → parent "frontend" */
     struct strvec paths;
     struct strvec depends_on;
     // Permissions
     int read_only;
     int owners_only;
+    int is_infrastructure; /* role = infrastructure */
 };
 
 /* 
