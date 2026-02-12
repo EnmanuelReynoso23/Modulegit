@@ -59,16 +59,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build Git with ModuleGit (MINGW64)
-        run: make -j$(nproc) NO_PERL=1 NO_PYTHON=1 CURLDIR=/mingw64
+        run: make -j$(nproc) NO_PERL=1 NO_PYTHON=1 NO_GETTEXT=YesPlease CURLDIR=/mingw64
 
       - name: Verify modgit subcommand
         run: ./git.exe modgit list 2>&1 || true
 
-      - name: Package Windows binary
+      - name: Package Windows binary with DLLs
         run: |
           mkdir -p dist
           cp git.exe dist/git-modgit.exe
-          cd dist && zip modulegit-windows-amd64.zip git-modgit.exe
+          # Auto-detect and bundle all required MINGW64 DLLs
+          for dll in $(ldd git.exe | grep '/mingw64/' | awk '{print $3}'); do
+            cp "$dll" dist/
+          done
+          echo "Bundled DLLs:"
+          ls -la dist/*.dll 2>/dev/null || echo "No DLLs found"
+          cd dist && zip modulegit-windows-amd64.zip git-modgit.exe *.dll
 
       - uses: actions/upload-artifact@v4
         with:
