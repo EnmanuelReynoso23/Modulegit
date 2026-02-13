@@ -18,3 +18,16 @@ CODE_OF_CONDUCT.md -whitespace
 /Documentation/user-manual.adoc conflict-marker-size=32
 /t/t????-*.sh conflict-marker-size=32
 /t/unit-tests/clar/test/expected/* whitespace=-blank-at-eof
+
+# Linguist overrides - mark upstream Git files as vendored so GitHub
+# language stats reflect ModuleGit's own code (C), not gitweb's HTML/CSS/JS
+gitweb/** linguist-vendored
+Documentation/docbook-xsl.css linguist-vendored
+mock-monorepo/** linguist-vendored
+ModuleGit-Demo/** linguist-vendored
+
+# Ensure our C code is detected
+builtin/modgit.c linguist-detectable
+modgit.c linguist-detectable
+modgit.h linguist-detectable
+smoke_test.c linguist-detectable
