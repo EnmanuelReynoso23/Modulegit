@@ -1,0 +1,62 @@
+git-modgit(1)
+=============
+
+NAME
+----
+git-modgit - Manage monorepo modules
+
+SYNOPSIS
+--------
+[verse]
+'git modgit' <command> [<args>]
+
+DESCRIPTION
+-----------
+Manage modules within a monorepo using a `.modgit` configuration file.
+Supports sparse-checkout isolation, orphan branches per module, and
+bidirectional sync between branches.
+
+COMMANDS
+--------
+
+list::
+	List all defined modules in a tree hierarchy.
+
+switch [--full|--dev] <module>::
+	Focus on a module using sparse-checkout.
+	`--dev` hides other modules but keeps infrastructure files.
+	`--full` shows all files.
+
+status::
+	Show module-aware file status.
+
+commit <message>::
+	Commit only files belonging to the active module.
+
+reset::
+	Restore full repository visibility.
+
+orphan <module>::
+	Create an isolated orphan branch with only module files.
+
+sync [--source=<branch>]::
+	Pull module files from source branch into current orphan branch.
+
+push [--target=<branch>]::
+	Push module changes from orphan branch back to target branch.
+
+init <module> --path=<path> [--depends=<dep>]::
+	Add a new module definition to `.modgit`.
+
+clone <url> [--module=<name>]::
+	Clone a repository and activate a module.
+
+run <command>::
+	Run a command in the context of the active module.
+
+ai-context::
+	Generate context for AI/LLM tools.
+
+GIT
+---
+Part of the linkgit:git[1] suite
