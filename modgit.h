@@ -28,4 +28,6 @@ void list_modules(struct strvec *names);
 void free_module_def(struct module_def *module);
 void resolve_dependencies(struct module_def *module, struct strvec *all_paths);
 
+int strvec_contains(const struct strvec *array, const char *str);
+
 #endif

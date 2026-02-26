@@ -6,7 +6,7 @@
 static struct module_def *current_module = NULL;
 static const char *target_module_name = NULL;
 
-static int strvec_contains(const struct strvec *array, const char *str)
+int strvec_contains(const struct strvec *array, const char *str)
 {
     for (size_t i = 0; i < array->nr; i++) {
         if (!strcmp(array->v[i], str))
@@ -65,6 +65,9 @@ static char *detect_parent_name(const char *module_name)
 
 struct module_def *load_module_def(const char *module_name)
 {
+    if (access(".modgit", F_OK) != 0)
+        return NULL;
+
     /* Save globals (load_module_def may be called recursively for parent) */
     struct module_def *saved_module = current_module;
     const char *saved_target = target_module_name;
@@ -231,5 +234,7 @@ static int list_modules_cb(const char *var, const char *value,
 
 void list_modules(struct strvec *names)
 {
+    if (access(".modgit", F_OK) != 0)
+        return;
     git_config_from_file(list_modules_cb, ".modgit", names);
 }

@@ -544,32 +544,63 @@ static int cmd_modgit_commit(int argc, const char **argv, const char *prefix, st
     struct strvec module_paths = STRVEC_INIT;
     resolve_dependencies(mod, &module_paths);
 
-    // Get list of modified files
-    struct child_process diff_cmd = CHILD_PROCESS_INIT;
-    diff_cmd.git_cmd = 1;
-    strvec_push(&diff_cmd.args, "diff");
-    strvec_push(&diff_cmd.args, "--name-only");
-    diff_cmd.out = -1;  // capture stdout
-
-    if (start_command(&diff_cmd))
-        die(_("failed to get changed files"));
-
-    // Read output and classify files
-    FILE *fp = fdopen(diff_cmd.out, "r");
+    // Get list of modified files (both unstaged AND staged)
     struct strvec inside = STRVEC_INIT;
     struct strvec outside = STRVEC_INIT;
     char line[PATH_MAX];
 
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
-        if (path_belongs_to_module(line, &module_paths))
-            strvec_push(&inside, line);
-        else
-            strvec_push(&outside, line);
+    // Check unstaged changes
+    struct child_process diff_cmd = CHILD_PROCESS_INIT;
+    diff_cmd.git_cmd = 1;
+    strvec_push(&diff_cmd.args, "diff");
+    strvec_push(&diff_cmd.args, "--name-only");
+    diff_cmd.out = -1;
+
+    if (!start_command(&diff_cmd)) {
+        FILE *fp = fdopen(diff_cmd.out, "r");
+        while (fgets(line, sizeof(line), fp)) {
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            if (len == 0) continue;
+            if (path_belongs_to_module(line, &module_paths))
+                strvec_push(&inside, line);
+            else
+                strvec_push(&outside, line);
+        }
+        fclose(fp);
+        finish_command(&diff_cmd);
     }
-    fclose(fp);
-    finish_command(&diff_cmd);
+
+    // Also check staged (cached) changes
+    struct child_process diff_cached = CHILD_PROCESS_INIT;
+    diff_cached.git_cmd = 1;
+    strvec_push(&diff_cached.args, "diff");
+    strvec_push(&diff_cached.args, "--cached");
+    strvec_push(&diff_cached.args, "--name-only");
+    diff_cached.out = -1;
+
+    if (!start_command(&diff_cached)) {
+        FILE *fp2 = fdopen(diff_cached.out, "r");
+        while (fgets(line, sizeof(line), fp2)) {
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            if (len == 0) continue;
+            /* Skip duplicates already found in unstaged */
+            int dup = 0;
+            for (int d = 0; d < inside.nr; d++)
+                if (!strcmp(inside.v[d], line)) { dup = 1; break; }
+            if (!dup)
+                for (int d = 0; d < outside.nr; d++)
+                    if (!strcmp(outside.v[d], line)) { dup = 1; break; }
+            if (dup) continue;
+            if (path_belongs_to_module(line, &module_paths))
+                strvec_push(&inside, line);
+            else
+                strvec_push(&outside, line);
+        }
+        fclose(fp2);
+        finish_command(&diff_cached);
+    }
 
     // Warn about outside changes
     if (outside.nr > 0) {
@@ -590,28 +621,14 @@ static int cmd_modgit_commit(int argc, const char **argv, const char *prefix, st
     }
 
     // Stage only files inside the module
-    printf(_("Staging %d file(s) from module '%s':\n"), inside.nr, active);
+    printf(_("Staging %d file(s) from module '%s':\n"), (int)inside.nr, active);
     for (int i = 0; i < inside.nr; i++) {
         printf(_("  + %s\n"), inside.v[i]);
         const char *add_args[] = { "add", inside.v[i], NULL };
         run_git_cmd(add_args);
     }
 
-    // Create branch and commit
-    time_t now = time(NULL);
-    struct tm tm_buf;
-    struct tm *t = localtime_r(&now, &tm_buf);
-    char branch_name[256];
-    snprintf(branch_name, sizeof(branch_name), "modgit/%s-%04d%02d%02d-%02d%02d%02d",
-             active, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-             t->tm_hour, t->tm_min, t->tm_sec);
-
-    printf(_("\nCreating branch '%s'...\n"), branch_name);
-
-    const char *checkout_args[] = { "checkout", "-b", branch_name, NULL };
-    if (run_git_cmd(checkout_args))
-        warning(_("Could not create branch. Committing on current branch."));
-
+    // Commit on the current branch (no temporary branch creation)
     char full_msg[512];
     snprintf(full_msg, sizeof(full_msg), "[%s] %s", active, msg);
     const char *commit_args[] = { "commit", "-m", full_msg, NULL };
@@ -661,7 +678,12 @@ static int cmd_modgit_status(int argc, const char **argv, const char *prefix, st
             for (int i = 0; i < module_paths.nr; i++)
                 printf(_("    %s/\n"), module_paths.v[i]);
 
-            // Check for modified files and classify
+            // Check for modified files and classify (both unstaged AND staged)
+            struct strvec inside = STRVEC_INIT;
+            struct strvec outside = STRVEC_INIT;
+            char line[PATH_MAX];
+
+            // Unstaged changes
             struct child_process diff_cmd = CHILD_PROCESS_INIT;
             diff_cmd.git_cmd = 1;
             strvec_push(&diff_cmd.args, "diff");
@@ -670,10 +692,6 @@ static int cmd_modgit_status(int argc, const char **argv, const char *prefix, st
 
             if (!start_command(&diff_cmd)) {
                 FILE *fp = fdopen(diff_cmd.out, "r");
-                struct strvec inside = STRVEC_INIT;
-                struct strvec outside = STRVEC_INIT;
-                char line[PATH_MAX];
-
                 while (fgets(line, sizeof(line), fp)) {
                     size_t len = strlen(line);
                     if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
@@ -685,14 +703,41 @@ static int cmd_modgit_status(int argc, const char **argv, const char *prefix, st
                 }
                 fclose(fp);
                 finish_command(&diff_cmd);
+            }
 
-                printf(_("\n  Changes INSIDE your module (%zu):\n"), inside.nr);
+            // Staged (cached) changes — deduplicate
+            struct child_process diff_cached = CHILD_PROCESS_INIT;
+            diff_cached.git_cmd = 1;
+            strvec_push(&diff_cached.args, "diff");
+            strvec_push(&diff_cached.args, "--cached");
+            strvec_push(&diff_cached.args, "--name-only");
+            diff_cached.out = -1;
+
+            if (!start_command(&diff_cached)) {
+                FILE *fp2 = fdopen(diff_cached.out, "r");
+                while (fgets(line, sizeof(line), fp2)) {
+                    size_t len = strlen(line);
+                    if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+                    if (len == 0) continue;
+                    if (strvec_contains(&inside, line) || strvec_contains(&outside, line))
+                        continue;
+                    if (path_belongs_to_module(line, &module_paths))
+                        strvec_push(&inside, line);
+                    else
+                        strvec_push(&outside, line);
+                }
+                fclose(fp2);
+                finish_command(&diff_cached);
+            }
+
+            {
+                printf(_("\n  Changes INSIDE your module (%d):\n"), (int)inside.nr);
                 if (inside.nr == 0)
                     printf(_("    (none)\n"));
                 for (int i = 0; i < inside.nr; i++)
                     printf(_("    \033[32m+ %s\033[0m\n"), inside.v[i]);
 
-                printf(_("\n  Changes OUTSIDE your module (%zu):\n"), outside.nr);
+                printf(_("\n  Changes OUTSIDE your module (%d):\n"), (int)outside.nr);
                 if (outside.nr == 0)
                     printf(_("    (none)\n"));
                 for (int i = 0; i < outside.nr; i++)
@@ -741,6 +786,28 @@ static int cmd_modgit_reset(int argc, const char **argv, const char *prefix, str
 {
     printf(_("Resetting to full repository (deactivating module mode)...\n"));
 
+    /* Check if we're on an orphan branch (module/*) */
+    char *module_name = detect_module_from_branch();
+    if (module_name) {
+        const char *default_branch = detect_default_branch();
+        printf(_("  Currently on orphan branch 'module/%s'.\n"), module_name);
+        printf(_("  Switching back to '%s'...\n"), default_branch);
+
+        /* Clean untracked files that would block checkout */
+        const char *clean_args[] = { "clean", "-fd", NULL };
+        run_git_cmd(clean_args);
+
+        /* Switch back to the default branch */
+        const char *checkout_args[] = { "checkout", default_branch, NULL };
+        if (run_git_cmd(checkout_args)) {
+            /* If normal checkout fails, force it */
+            const char *force_args[] = { "checkout", "-f", default_branch, NULL };
+            run_git_cmd(force_args);
+        }
+
+        free(module_name);
+    }
+
     const char *disable_args[] = { "sparse-checkout", "disable", NULL };
     run_git_cmd(disable_args); // best effort
 
@@ -784,6 +851,11 @@ static int cmd_modgit_orphan(int argc, const char **argv, const char *prefix, st
     snprintf(branch_name, sizeof(branch_name), "module/%s", module_name);
 
     printf(_("Switching to isolated module branch '%s'...\n"), branch_name);
+
+    /* Disable sparse-checkout first so all files are visible for orphan creation */
+    const char *disable_sparse[] = { "sparse-checkout", "disable", NULL };
+    run_git_cmd(disable_sparse);
+    clear_active_module();
 
     /* Clean untracked files that might block branch switching */
     const char *clean_args[] = { "clean", "-fd", NULL };
@@ -845,6 +917,22 @@ static int cmd_modgit_orphan(int argc, const char **argv, const char *prefix, st
 }
 
 /*
+ * ── Helper: detect default branch (main or master) ───────
+ * Checks if 'main' exists first, falls back to 'master'.
+ */
+static const char *detect_default_branch(void)
+{
+    struct child_process cmd = CHILD_PROCESS_INIT;
+    cmd.git_cmd = 1;
+    strvec_pushl(&cmd.args, "rev-parse", "--verify", "main", NULL);
+    cmd.no_stdout = 1;
+    cmd.no_stderr = 1;
+    if (run_command(&cmd) == 0)
+        return "main";
+    return "master";
+}
+
+/*
  * ── Helper: detect module name from branch ───────────────
  * If on branch "module/foo", returns "foo". Caller must free().
  */
@@ -886,15 +974,18 @@ static char *detect_module_from_branch(void)
 
 static int cmd_modgit_sync(int argc, const char **argv, const char *prefix, struct repository *repo)
 {
-    const char *source_branch = "master";
+    const char *source_branch = NULL;
 
     struct option options[] = {
         OPT_STRING(0, "source", &source_branch, N_("branch"),
-                   N_("source branch to sync from (default: master)")),
+                   N_("source branch to sync from (default: auto-detect)")),
         OPT_END()
     };
 
     argc = parse_options(argc, argv, prefix, options, modgit_usage, 0);
+
+    if (!source_branch)
+        source_branch = detect_default_branch();
 
     // Detect module from branch name
     char *module_name = detect_module_from_branch();
@@ -908,6 +999,15 @@ static int cmd_modgit_sync(int argc, const char **argv, const char *prefix, stru
 
     struct strvec paths = STRVEC_INIT;
     resolve_dependencies(mod, &paths);
+
+    /* Verify source branch exists */
+    struct child_process verify_src = CHILD_PROCESS_INIT;
+    verify_src.git_cmd = 1;
+    strvec_pushl(&verify_src.args, "rev-parse", "--verify", source_branch, NULL);
+    verify_src.no_stdout = 1;
+    verify_src.no_stderr = 1;
+    if (run_command(&verify_src))
+        die(_("source branch '%s' does not exist"), source_branch);
 
     printf(_("Syncing module '%s' from '%s'...\n"), module_name, source_branch);
 
@@ -963,15 +1063,18 @@ static int cmd_modgit_sync(int argc, const char **argv, const char *prefix, stru
 
 static int cmd_modgit_push(int argc, const char **argv, const char *prefix, struct repository *repo)
 {
-    const char *target_branch = "master";
+    const char *target_branch = NULL;
 
     struct option options[] = {
         OPT_STRING(0, "target", &target_branch, N_("branch"),
-                   N_("target branch to push to (default: master)")),
+                   N_("target branch to push to (default: auto-detect)")),
         OPT_END()
     };
 
     argc = parse_options(argc, argv, prefix, options, modgit_usage, 0);
+
+    if (!target_branch)
+        target_branch = detect_default_branch();
 
     // Detect module from branch name
     char *module_name = detect_module_from_branch();
@@ -993,6 +1096,15 @@ static int cmd_modgit_push(int argc, const char **argv, const char *prefix, stru
         strvec_push(&paths, mod->paths.v[i]);
 
     printf(_("Pushing module '%s' changes to '%s'...\n"), module_name, target_branch);
+
+    /* Verify target branch exists */
+    struct child_process verify_cmd = CHILD_PROCESS_INIT;
+    verify_cmd.git_cmd = 1;
+    strvec_pushl(&verify_cmd.args, "rev-parse", "--verify", target_branch, NULL);
+    verify_cmd.no_stdout = 1;
+    verify_cmd.no_stderr = 1;
+    if (run_command(&verify_cmd))
+        die(_("target branch '%s' does not exist"), target_branch);
 
     /* Clean untracked files that might block checkout to target branch */
     const char *clean_args[] = { "clean", "-fd", NULL };
