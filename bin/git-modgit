@@ -1,0 +1,793 @@
+#!/bin/bash
+# git-modgit — Shell implementation of ModuleGit commands
+# This mirrors the C code in builtin/modgit.c for testing purposes
+
+# No set -e: we handle errors manually
+
+MODGIT_FILE=".modgit"
+ACTIVE_FILE=".git/modgit-active"
+
+# ── Helpers ──────────────────────────────────────────────
+
+die() { echo "error: $1" >&2; exit 128; }
+hint() { echo "hint: $1" >&2; }
+
+save_active() { echo "$1" > "$ACTIVE_FILE"; }
+read_active() { [ -f "$ACTIVE_FILE" ] && cat "$ACTIVE_FILE" | tr -d '\n' || echo ""; }
+clear_active() { rm -f "$ACTIVE_FILE"; }
+
+# Parse .modgit and get paths for a module
+get_module_paths() {
+    local mod="$1"
+    git config -f "$MODGIT_FILE" --get-all "module.$mod.path" 2>/dev/null
+}
+
+# Get dependencies for a module
+get_module_deps() {
+    local mod="$1"
+    git config -f "$MODGIT_FILE" --get-all "module.$mod.depends" 2>/dev/null
+}
+
+# Get parent name from nested module (frontend/css → frontend)
+get_parent() {
+    local name="$1"
+    if [[ "$name" == */* ]]; then
+        echo "${name%/*}"
+    fi
+}
+
+# List all module names
+get_all_modules() {
+    git config -f "$MODGIT_FILE" --name-only --get-regexp '^module\..*\.path$' 2>/dev/null | \
+        sed 's/^module\.\(.*\)\.path$/\1/' | sort -u
+}
+
+# Resolve all paths including dependencies (with cycle detection)
+resolve_paths() {
+    local mod="$1"
+    local visited="$2"
+
+    # Cycle detection
+    if echo "$visited" | grep -qw "$mod"; then
+        echo "warning: circular dependency detected: '$mod'" >&2
+        return
+    fi
+    visited="$visited $mod"
+
+    # Get own paths
+    get_module_paths "$mod"
+
+    # Get deps (inherit from parent if none)
+    local deps
+    deps=$(get_module_deps "$mod")
+    if [ -z "$deps" ]; then
+        local parent
+        parent=$(get_parent "$mod")
+        if [ -n "$parent" ]; then
+            deps=$(get_module_deps "$parent")
+        fi
+    fi
+
+    # Recurse into deps
+    for dep in $deps; do
+        resolve_paths "$dep" "$visited"
+    done
+}
+
+# Get deduplicated paths (one per line, preserves spaces)
+get_all_paths() {
+    local mod="$1"
+    resolve_paths "$mod" "" | sort -u
+}
+
+# Read paths into an array (handles spaces in paths)
+read_paths_array() {
+    local mod="$1"
+    local -n _arr=$2
+    _arr=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && _arr+=("$line")
+    done < <(get_all_paths "$mod")
+}
+
+# Detect module from branch name (module/foo → foo)
+detect_module_from_branch() {
+    local branch
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+    if [[ "$branch" == module/* ]]; then
+        echo "${branch#module/}"
+    fi
+}
+
+# Detect default branch (main or master)
+detect_default_branch() {
+    if git rev-parse --verify main >/dev/null 2>&1; then
+        echo "main"
+    else
+        echo "master"
+    fi
+}
+
+# ── LIST ─────────────────────────────────────────────────
+
+cmd_list() {
+    if [ ! -f "$MODGIT_FILE" ]; then
+        echo "No modules found."
+        hint "Create a .modgit file in the root to define modules."
+        return
+    fi
+
+    local active
+    active=$(read_active)
+    local modules
+    modules=$(get_all_modules)
+
+    if [ -z "$modules" ]; then
+        echo "No modules found."
+        hint "Create a .modgit file in the root to define modules."
+        return
+    fi
+
+    echo "Available modules:"
+
+    local prev_root=""
+    while IFS= read -r mod; do
+        local label=""
+        [ "$mod" = "$active" ] && label=" $(printf '\033[32m(active)\033[0m')"
+
+        if [[ "$mod" == */* ]]; then
+            # Nested module — show with tree connector
+            local leaf="${mod##*/}"
+            local depth=$(echo "$mod" | tr -cd '/' | wc -c)
+            local indent=""
+            for ((d=1; d<depth; d++)); do indent="    $indent"; done
+
+            # Check if last sibling
+            local parent_prefix="${mod%/*}/"
+            local is_last=1
+            local found_self=0
+            while IFS= read -r other; do
+                if [ "$other" = "$mod" ]; then
+                    found_self=1
+                    continue
+                fi
+                if [ $found_self -eq 1 ] && [[ "$other" == ${parent_prefix}* ]] && [ "$(echo "$other" | tr -cd '/' | wc -c)" -eq "$depth" ]; then
+                    is_last=0
+                    break
+                fi
+            done <<< "$modules"
+
+            if [ $is_last -eq 1 ]; then
+                echo "    ${indent}└── ${leaf}${label}"
+            else
+                echo "    ${indent}├── ${leaf}${label}"
+            fi
+        else
+            echo "  ${mod}${label}"
+        fi
+    done <<< "$modules"
+}
+
+# ── DEV MODE SPARSE PATTERNS ─────────────────────────────
+# Generates sparse-checkout patterns that hide other modules
+# but keep all infrastructure (configs, package.json, etc.)
+
+build_dev_sparse() {
+    local mod="$1"
+
+    # 1. Collect my module's paths (with deps resolved)
+    local my_paths=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && my_paths+=("$line")
+    done < <(get_all_paths "$mod")
+
+    # 2. Collect ALL module paths from every module in .modgit
+    local all_module_paths=()
+    while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        while IFS= read -r p; do
+            [ -n "$p" ] && all_module_paths+=("$p")
+        done < <(get_module_paths "$m")
+    done < <(get_all_modules)
+
+    # 3. Calculate paths to exclude = all_module_paths - my_paths
+    local exclude_paths=()
+    for ap in "${all_module_paths[@]}"; do
+        local is_mine=0
+        for mp in "${my_paths[@]}"; do
+            if [ "$ap" = "$mp" ] || [[ "$ap" == "$mp/"* ]] || [[ "$mp" == "$ap/"* ]]; then
+                is_mine=1
+                break
+            fi
+        done
+        if [ $is_mine -eq 0 ]; then
+            exclude_paths+=("$ap")
+        fi
+    done
+
+    # Deduplicate exclude_paths
+    local unique_excludes=()
+    local seen_excludes=""
+    for ep in "${exclude_paths[@]}"; do
+        if ! echo "$seen_excludes" | grep -qF "|$ep|"; then
+            unique_excludes+=("$ep")
+            seen_excludes="${seen_excludes}|$ep|"
+        fi
+    done
+
+    # 4. For each path to exclude, compute the PARENT directory re-open chain
+    # To exclude apps/web/src/modulos/admin we need to re-open:
+    #   !/apps/  /apps/*  !/apps/web/  /apps/web/*  !/apps/web/src/  /apps/web/src/*
+    #   !/apps/web/src/modulos/  /apps/web/src/modulos/*
+    # Then exclude: !/apps/web/src/modulos/admin/
+    # KEY: re-open PARENTS only, NOT the excluded path itself
+    local reopen_lines=()
+    local seen_reopens=""
+
+    for ep in "${unique_excludes[@]}"; do
+        IFS='/' read -ra parts <<< "$ep"
+        local accum=""
+        local i
+        # Iterate over PARENT directories only (< length, not <= )
+        for (( i=0; i < ${#parts[@]}; i++ )); do
+            accum="${accum}${parts[$i]}/"
+            # Only re-open if this is a PARENT (not the exclude target itself)
+            if [ "$accum" != "${ep}/" ] && [ "$accum" != "${ep}" ]; then
+                local pair="!/${accum} /${accum%/}/*"
+                if ! echo "$seen_reopens" | grep -qF "|$pair|"; then
+                    reopen_lines+=("!/${accum}" "/${accum%/}/*")
+                    seen_reopens="${seen_reopens}|$pair|"
+                fi
+            fi
+        done
+    done
+
+    # 5. Write the sparse-checkout file
+    git sparse-checkout init --no-cone 2>/dev/null || true
+    local sc_file="$(git rev-parse --git-dir)/info/sparse-checkout"
+
+    {
+        echo "/*"
+        echo ".modgit"
+        # Write re-open lines (parent directories only)
+        for line in "${reopen_lines[@]}"; do
+            echo "$line"
+        done
+        # Write exclusions
+        for ep in "${unique_excludes[@]}"; do
+            echo "!/${ep}/"
+            echo "!/${ep}"
+        done
+    } > "$sc_file"
+
+    git read-tree -mu HEAD 2>/dev/null || true
+}
+
+# ── SWITCH ───────────────────────────────────────────────
+
+cmd_switch() {
+    local full_mode=0
+    local dev_mode=0
+    local mod=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --full) full_mode=1; shift;;
+            --dev) dev_mode=1; shift;;
+            --module=*) mod="${1#--module=}"; shift;;
+            -*) die "unknown option: $1";;
+            *) mod="$1"; shift;;
+        esac
+    done
+
+    [ -z "$mod" ] && die "module name is required"
+
+    local paths_arr=()
+    read_paths_array "$mod" paths_arr
+    [ ${#paths_arr[@]} -eq 0 ] && die "module '$mod' not found or has no paths"
+
+    if [ $full_mode -eq 1 ]; then
+        git sparse-checkout disable 2>/dev/null || true
+        save_active "$mod"
+        echo "Switched to module '$mod' (full mode — all files visible)"
+        echo "  Your module paths: $(IFS=', '; echo "${paths_arr[*]}")"
+        echo "  hint: 'git modgit commit' will only commit files inside your module."
+    elif [ $dev_mode -eq 1 ]; then
+        # Dev mode: hide other modules' code, keep all infrastructure
+        build_dev_sparse "$mod"
+        save_active "$mod"
+        echo ""
+        echo "Switched to module '$mod' (dev mode)"
+        echo "  Your module paths:"
+        for p in "${paths_arr[@]}"; do
+            echo "    $p/"
+        done
+        echo "  Infrastructure files: visible (configs, package.json, etc.)"
+        echo "  Other modules: hidden"
+        local deps
+        deps=$(get_module_deps "$mod")
+        if [ -n "$deps" ]; then
+            echo "  Dependencies included: $(echo $deps | tr '\n' ', ' | sed 's/,$//')"
+        fi
+        echo ""
+        echo "  You can run build tools (npm run dev, etc.)"
+        echo "  'git modgit commit' will only commit files inside your module."
+        echo "  Use 'git modgit reset' to restore all files."
+    else
+        # Always include .modgit so module definitions remain accessible
+        git sparse-checkout set --no-cone "${paths_arr[@]}" .modgit 2>/dev/null || true
+        save_active "$mod"
+        echo ""
+        echo "Switched to module '$mod'"
+        echo "  Only these paths are now visible:"
+        for p in "${paths_arr[@]}"; do
+            echo "    $p/"
+        done
+        local deps
+        deps=$(get_module_deps "$mod")
+        if [ -n "$deps" ]; then
+            echo "  Dependencies included: $(echo $deps | tr '\n' ', ' | sed 's/,$//')"
+        fi
+        echo ""
+        echo "  Everything else is hidden. Use 'git modgit reset' to restore all files."
+    fi
+}
+
+# ── STATUS ───────────────────────────────────────────────
+
+cmd_status() {
+    local active
+    active=$(read_active)
+
+    echo "ModuleGit Status:"
+    echo ""
+
+    if [ -n "$active" ]; then
+        echo "  Active module: $active"
+
+        local paths_arr=()
+        read_paths_array "$active" paths_arr
+
+        echo "  Module paths:"
+        for p in "${paths_arr[@]}"; do
+            echo "    $p/"
+        done
+
+        # Classify changed files (deduplicate staged + unstaged)
+        local inside=()
+        local outside=()
+        local seen_status=()
+        while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            # Skip duplicates
+            local is_dup=0
+            for s in "${seen_status[@]}"; do
+                [ "$s" = "$file" ] && { is_dup=1; break; }
+            done
+            [ $is_dup -eq 1 ] && continue
+            seen_status+=("$file")
+            local match=0
+            for p in "${paths_arr[@]}"; do
+                if [[ "$file" == "$p" || "$file" == "$p/"* ]]; then
+                    match=1
+                    break
+                fi
+            done
+            if [ $match -eq 1 ]; then
+                inside+=("$file")
+            else
+                outside+=("$file")
+            fi
+        done < <(git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null)
+
+        echo ""
+        echo "  Changes INSIDE your module (${#inside[@]}):"
+        if [ ${#inside[@]} -eq 0 ]; then
+            echo "    (none)"
+        else
+            for f in "${inside[@]}"; do
+                printf "    \033[32m+ %s\033[0m\n" "$f"
+            done
+        fi
+
+        echo ""
+        echo "  Changes OUTSIDE your module (${#outside[@]}):"
+        if [ ${#outside[@]} -eq 0 ]; then
+            echo "    (none)"
+        else
+            for f in "${outside[@]}"; do
+                printf "    \033[31m! %s (not yours)\033[0m\n" "$f"
+            done
+        fi
+    else
+        echo "  No active module (full repository mode)"
+        hint "Use 'git modgit switch <module>' to focus on a module."
+    fi
+
+    echo ""
+    echo "  Defined modules: $(get_all_modules | tr '\n' ', ' | sed 's/,$//')"
+    echo ""
+    git status --short
+}
+
+# ── RESET ────────────────────────────────────────────────
+
+cmd_reset() {
+    echo "Resetting to full repository (deactivating module mode)..."
+
+    # Check if we're on an orphan branch (module/*)
+    local branch
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+    if [[ "$branch" == module/* ]]; then
+        local default_branch
+        default_branch=$(detect_default_branch)
+        echo "  Currently on orphan branch '$branch'."
+        echo "  Switching back to '$default_branch'..."
+
+        # Clean untracked files that would block checkout
+        git clean -fd 2>/dev/null || true
+
+        # Switch back to the default branch
+        if ! git checkout "$default_branch" 2>/dev/null; then
+            # If checkout fails, force it
+            git checkout -f "$default_branch" 2>/dev/null || true
+        fi
+    fi
+
+    git sparse-checkout disable 2>/dev/null || true
+    clear_active
+    echo "Done. Module mode deactivated. All files visible, no restrictions."
+}
+
+# ── ORPHAN ───────────────────────────────────────────────
+
+cmd_orphan() {
+    local mod=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --module=*) mod="${1#--module=}"; shift;;
+            -*) shift;;
+            *) mod="$1"; shift;;
+        esac
+    done
+
+    [ -z "$mod" ] && die "module name is required"
+
+    local paths_arr=()
+    read_paths_array "$mod" paths_arr
+    [ ${#paths_arr[@]} -eq 0 ] && die "module '$mod' not found"
+
+    local branch="module/$mod"
+    echo "Switching to isolated module branch '$branch'..."
+
+    # Disable sparse-checkout first so all files are visible for orphan creation
+    git sparse-checkout disable 2>/dev/null || true
+    clear_active
+
+    # Clean untracked files that might block branch switching
+    git clean -fd 2>/dev/null || true
+
+    # Check if branch already exists
+    if git rev-parse --verify "$branch" >/dev/null 2>&1; then
+        git switch "$branch"
+        return
+    fi
+
+    # Create orphan branch
+    git checkout --orphan "$branch"
+
+    # Reset index
+    git reset
+
+    # Add only module paths + .modgit
+    git add "${paths_arr[@]}" .modgit 2>/dev/null || true
+
+    # Commit
+    git commit -m "Initialize module branch"
+
+    # Clean everything else
+    echo "Cleaning up non-module files..."
+    git clean -fd
+
+    echo "Success! You are now on isolated branch '$branch'."
+}
+
+# ── SYNC ─────────────────────────────────────────────────
+
+cmd_sync() {
+    local source=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source=*) source="${1#--source=}"; shift;;
+            *) shift;;
+        esac
+    done
+    [ -z "$source" ] && source=$(detect_default_branch)
+
+    local mod
+    mod=$(detect_module_from_branch)
+    [ -z "$mod" ] && die "not on a module branch (expected branch 'module/<name>')"
+
+    local paths_arr=()
+    read_paths_array "$mod" paths_arr
+
+    # Verify source branch exists
+    if ! git rev-parse --verify "$source" >/dev/null 2>&1; then
+        die "source branch '$source' does not exist"
+    fi
+
+    echo "Syncing module '$mod' from '$source'..."
+
+    git checkout "$source" -- "${paths_arr[@]}" .modgit 2>/dev/null || {
+        echo "warning: failed to checkout files from '$source'" >&2
+        return 1
+    }
+
+    if ! git diff --cached --quiet 2>/dev/null; then
+        git commit -m "Sync module '$mod' from $source"
+        echo "Synced successfully. Changes from '$source' applied."
+    else
+        echo "Already up to date. No changes to sync."
+    fi
+}
+
+# ── PUSH ─────────────────────────────────────────────────
+
+cmd_push() {
+    local target=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --target=*) target="${1#--target=}"; shift;;
+            *) shift;;
+        esac
+    done
+    [ -z "$target" ] && target=$(detect_default_branch)
+
+    local mod
+    mod=$(detect_module_from_branch)
+    [ -z "$mod" ] && die "not on a module branch (expected branch 'module/<name>')"
+
+    local orphan_branch="module/$mod"
+    # For push, only use the module's OWN paths (not dependencies)
+    # Dependencies belong to other modules and shouldn't be pushed back
+    local paths_arr=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && paths_arr+=("$line")
+    done < <(get_module_paths "$mod")
+    [ ${#paths_arr[@]} -eq 0 ] && die "module '$mod' has no paths"
+
+    echo "Pushing module '$mod' changes to '$target'..."
+
+    # Verify target branch exists
+    if ! git rev-parse --verify "$target" >/dev/null 2>&1; then
+        die "target branch '$target' does not exist"
+    fi
+
+    # Clean untracked files that might block checkout to target branch
+    git clean -fd 2>/dev/null || true
+
+    git checkout "$target"
+
+    git checkout "$orphan_branch" -- "${paths_arr[@]}" 2>/dev/null || {
+        echo "warning: failed to checkout files from '$orphan_branch'" >&2
+        git checkout "$orphan_branch"
+        return 1
+    }
+
+    git add "${paths_arr[@]}"
+
+    if ! git diff --cached --quiet 2>/dev/null; then
+        git commit -m "[$mod] Update from isolated branch"
+        echo "Changes from module '$mod' applied to '$target'."
+    else
+        echo "No changes to push. Module files are identical."
+    fi
+
+    # Clean untracked files before switching back to orphan
+    git clean -fd 2>/dev/null || true
+    git checkout "$orphan_branch"
+    echo "Back on branch '$orphan_branch'."
+}
+
+# ── COMMIT ───────────────────────────────────────────────
+
+cmd_commit() {
+    local msg="${1:-Module update}"
+    local active
+    active=$(read_active)
+
+    if [ -z "$active" ]; then
+        echo "No active module. Committing all changes..."
+        git add -u
+        git commit -m "$msg"
+        return
+    fi
+
+    echo "Committing changes for module '$active'..."
+
+    local paths_arr=()
+    read_paths_array "$active" paths_arr
+
+    local inside=()
+    local outside=()
+    local seen=()
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        # Skip duplicates (file can appear in both unstaged and staged)
+        local is_dup=0
+        for s in "${seen[@]}"; do
+            [ "$s" = "$file" ] && { is_dup=1; break; }
+        done
+        [ $is_dup -eq 1 ] && continue
+        seen+=("$file")
+        local match=0
+        for p in "${paths_arr[@]}"; do
+            if [[ "$file" == "$p" || "$file" == "$p/"* ]]; then match=1; break; fi
+        done
+        if [ $match -eq 1 ]; then inside+=("$file"); else outside+=("$file"); fi
+    done < <(git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null)
+
+    if [ ${#outside[@]} -gt 0 ]; then
+        echo "warning: Files OUTSIDE module '$active' will NOT be committed:" >&2
+        for f in "${outside[@]}"; do echo "  $f" >&2; done
+    fi
+
+    if [ ${#inside[@]} -eq 0 ]; then
+        echo "No changes inside module '$active'. Nothing to commit."
+        return
+    fi
+
+    echo "Staging ${#inside[@]} file(s) from module '$active':"
+    for f in "${inside[@]}"; do
+        echo "  + $f"
+        git add "$f"
+    done
+
+    git commit -m "[$active] $msg"
+}
+
+# ── INIT ─────────────────────────────────────────────────
+
+cmd_init() {
+    local mod=""
+    local paths=()
+    local deps=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --path=*) paths+=("${1#--path=}"); shift;;
+            --depends=*) deps+=("${1#--depends=}"); shift;;
+            -*) die "unknown option: $1";;
+            *) [ -z "$mod" ] && mod="$1"; shift;;
+        esac
+    done
+
+    [ -z "$mod" ] && die "usage: git modgit init <name> --path=<path> [--path=<path>...] [--depends=<dep>...]"
+    [ ${#paths[@]} -eq 0 ] && die "at least one --path is required"
+
+    # Append to .modgit
+    {
+        echo ""
+        echo "[module \"$mod\"]"
+        for p in "${paths[@]}"; do
+            echo "	path = $p"
+        done
+        for d in "${deps[@]}"; do
+            echo "	depends = $d"
+        done
+    } >> "$MODGIT_FILE"
+
+    echo "Module '$mod' added to .modgit"
+    echo "  Paths: $(IFS=', '; echo "${paths[*]}")"
+    [ ${#deps[@]} -gt 0 ] && echo "  Depends on: $(IFS=', '; echo "${deps[*]}")"
+
+    if [[ "$mod" == */* ]]; then
+        echo "  (nested submodule of '${mod%/*}')"
+    fi
+}
+
+# ── RUN ──────────────────────────────────────────────────
+
+cmd_run() {
+    [ $# -eq 0 ] && die "usage: git modgit run <command>"
+    printf "Running in module context: %s\n" "$*"
+    "$@"
+}
+
+# ── AI-CONTEXT ───────────────────────────────────────────
+
+cmd_ai_context() {
+    local mod=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --module=*) mod="${1#--module=}"; shift;;
+            *) shift;;
+        esac
+    done
+
+    [ -z "$mod" ] && die "module name is required"
+
+    local paths
+    paths=$(get_all_paths "$mod")
+
+    echo "Subject: Context for module '$mod'"
+    echo ""
+    echo "This context includes the following paths:"
+    for p in $paths; do echo "- $p"; done
+}
+
+# ── CLONE ────────────────────────────────────────────────
+
+cmd_clone() {
+    local mod=""
+    local url=""
+    local dir=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --module=*) mod="${1#--module=}"; shift;;
+            -*) shift;;
+            *)
+                if [ -z "$url" ]; then url="$1"
+                elif [ -z "$dir" ]; then dir="$1"
+                fi
+                shift;;
+        esac
+    done
+
+    [ -z "$mod" ] && die "module name is required for clone"
+    [ -z "$url" ] && die "repository url is required"
+    [ -z "$dir" ] && dir="repo"
+
+    echo "Cloning module '$mod' from '$url'..."
+    git clone --filter=blob:none --sparse "$url" "$dir"
+    cd "$dir"
+    cmd_switch "$mod"
+}
+
+# ── DISPATCH ─────────────────────────────────────────────
+
+case "${1:-}" in
+    list)       shift; cmd_list "$@";;
+    switch)     shift; cmd_switch "$@";;
+    status)     shift; cmd_status "$@";;
+    reset)      shift; cmd_reset "$@";;
+    orphan)     shift; cmd_orphan "$@";;
+    sync)       shift; cmd_sync "$@";;
+    push)       shift; cmd_push "$@";;
+    commit)     shift; cmd_commit "$@";;
+    init)       shift; cmd_init "$@";;
+    run)        shift; cmd_run "$@";;
+    clone)      shift; cmd_clone "$@";;
+    ai-context) shift; cmd_ai_context "$@";;
+    help|""|--help|-h)
+        echo ""
+        echo "  ModuleGit - Modular Git for Monorepos"
+        echo "  ======================================"
+        echo ""
+        echo "  usage: git modgit <command> [<args>]"
+        echo ""
+        echo "  Core Workflow:"
+        echo "    switch [--full|--dev] <module>  Switch to a module"
+        echo "    status                          Show module-aware status"
+        echo "    commit [message]                Module-scoped commit"
+        echo "    reset                           Restore full repo visibility"
+        echo "    run <command>                   Run command in module context"
+        echo ""
+        echo "  Setup & Discovery:"
+        echo "    list                            List all modules"
+        echo "    clone --module=<name> <url>     Partial clone for a module"
+        echo "    init <name> --path=<p>          Add module to .modgit"
+        echo "    ai-context --module=<name>      Generate AI context dump"
+        echo ""
+        echo "  Orphan Branches:"
+        echo "    orphan <module>                 Create isolated module branch"
+        echo "    sync [--source=<branch>]        Sync from source branch"
+        echo "    push [--target=<branch>]        Push changes to target branch"
+        echo ""
+        echo "    help                            Show this help message"
+        echo ""
+        ;;
+    *)
+        die "unknown command '$1'. Run 'git modgit help' for usage.";;
+esac
