@@ -139,6 +139,7 @@ git-merge-index                         plumbingmanipulators
 git-merge-one-file                      purehelpers
 git-merge-tree                          ancillaryinterrogators
 git-mergetool                           ancillarymanipulators           complete
+git-modgit                              mainporcelain
 git-mktag                               plumbingmanipulators
 git-mktree                              plumbingmanipulators
 git-multi-pack-index                    plumbingmanipulators
