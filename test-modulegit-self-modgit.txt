@@ -1,0 +1,34 @@
+[module "modgit-core"]
+    path = builtin/modgit.c
+    path = modgit.c
+    path = modgit.h
+
+[module "modgit-tests"]
+    path = t/t9900-modgit.sh
+    depends = modgit-core
+
+[module "modgit-docs"]
+    path = Documentation/git-modgit.adoc
+    depends = modgit-core
+
+[module "git-builtin"]
+    path = builtin
+
+[module "git-tests"]
+    path = t
+
+[module "git-docs"]
+    path = Documentation
+
+[module "git-contrib"]
+    path = contrib
+
+[module "git-i18n"]
+    path = po
+
+[module "git-gui"]
+    path = git-gui
+    path = gitk-git
+
+[module "git-web"]
+    path = gitweb
